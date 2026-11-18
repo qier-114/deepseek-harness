@@ -55,11 +55,26 @@ export function connectDesktopWelcome(
   ): Promise<unknown> => {
     const rpcId = randomUUID()
     const method = `${request.namespace}/${request.method}`
-    const response = await send(new URL(`/api/${method}`, origin).href, {
+    const url = new URL(`/api/${method}`, origin).href
+    const init: RequestInit = {
       method: 'POST', redirect: 'error', ...(signal === undefined ? {} : { signal }),
       headers: { 'content-type': 'application/json', cookie },
       body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args: request.args } }),
-    })
+    }
+    // A Host listener that is still settling right after startup resets in-flight
+    // connections (ECONNRESET). The RPC body is a string, so a bounded retry is
+    // safe; callers that pass their own timeout signal keep that deadline.
+    const postWithRetry = async (attempt = 0): Promise<Response> => {
+      try {
+        return await send(url, init)
+      } catch (error) {
+        const code = (error as { cause?: { code?: string } }).cause?.code
+        if (signal !== undefined || attempt >= 2 || (code !== 'ECONNRESET' && code !== 'UND_ERR_SOCKET')) throw error
+        await new Promise(resolve => setTimeout(resolve, 150 * (attempt + 1)))
+        return postWithRetry(attempt + 1)
+      }
+    }
+    const response = await postWithRetry()
     if (!response.ok) throw new Error('desktop welcome: Web request failed')
     const envelope: unknown = await response.json()
     if (!record(envelope) || envelope.type !== 'server-response' || envelope.rpcId !== rpcId
